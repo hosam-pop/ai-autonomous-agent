@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+/workspace/
+/agent_workspace/
+*.log
+/tmp/
+*.gguf
+/model/
+.DS_Store
