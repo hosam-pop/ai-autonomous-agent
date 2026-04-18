@@ -234,11 +234,16 @@
     <span class="chip ok" id="modelChip">__MODEL_LABEL__</span>
     <span class="chip" id="hc">•</span>
     <div class="spacer"></div>
-    <div class="mode">
-      <button id="m-run" class="active" title="خطة → تنفيذ → نقد">🧠 Plan-Execute</button>
-      <button id="m-agent" title="ReAct واحد، أسرع">⚡ Fast</button>
-      <button id="m-aider" title="Aider OSS (أسرع للكود)">💎 Aider</button>
-      <button id="m-claw" title="Claw CLI (بطيء)">🦀 Claw</button>
+    <div class="mode" style="gap:6px;align-items:center;">
+      <select id="laneSel" title="نوع المهمة" style="background:#1b1e25;color:#eaeaf3;border:1px solid #2a2d36;border-radius:8px;padding:6px 10px;font-size:13px;">
+        <option value="auto">🤖 تلقائي</option>
+        <option value="chat">💬 دردشة</option>
+        <option value="aider">💎 كود (Aider)</option>
+        <option value="agent">⚡ تنفيذ (ReAct)</option>
+        <option value="plan">🧠 خطة + تنفيذ + نقد</option>
+      </select>
+      <select id="modelSel" title="النموذج" style="background:#1b1e25;color:#eaeaf3;border:1px solid #2a2d36;border-radius:8px;padding:6px 10px;font-size:13px;"></select>
+      <button id="m-claw" class="icon-btn" title="Claw Code (بطيء)" style="opacity:.6;">🦀</button>
     </div>
     <button class="icon-btn" id="btnReset" title="مسح الـ workspace">🗑️</button>
   </div>
@@ -304,14 +309,41 @@ marked.setOptions({
   highlight: (code, lang) => { try { return hljs.highlight(code,{language: lang||'plaintext'}).value; } catch { return code; } },
 });
 
-let mode = 'run';
-['run','agent','aider','claw'].forEach(k => {
-  document.getElementById('m-'+k).onclick = () => {
-    mode = k;
-    document.querySelectorAll('.mode button').forEach(b=>b.classList.remove('active'));
-    document.getElementById('m-'+k).classList.add('active');
-  };
-});
+let mode = 'ask';
+let lane = 'auto';
+const laneSel = document.getElementById('laneSel');
+const modelSel = document.getElementById('modelSel');
+laneSel.onchange = () => { lane = laneSel.value; };
+document.getElementById('m-claw').onclick = () => {
+  mode = (mode === 'claw') ? 'ask' : 'claw';
+  document.getElementById('m-claw').style.opacity = (mode === 'claw') ? '1' : '.6';
+};
+
+async function refreshModels() {
+  try {
+    const r = await fetch('/models'); const j = await r.json();
+    modelSel.innerHTML = '';
+    (j.models||[]).forEach(m => {
+      if (!m.available) return;
+      const opt = document.createElement('option');
+      opt.value = m.id; opt.textContent = m.label + ' · ' + m.ram_gb + 'GB';
+      if (m.active) opt.selected = true;
+      modelSel.appendChild(opt);
+    });
+  } catch(e) { console.error(e); }
+}
+refreshModels();
+modelSel.onchange = async () => {
+  const chip = document.getElementById('modelChip');
+  chip.textContent = 'جاري تبديل النموذج…'; chip.classList.remove('ok');
+  try {
+    const r = await fetch('/switch_model', {method:'POST', headers:{'content-type':'application/json'},
+                                              body: JSON.stringify({model_id: modelSel.value})});
+    const j = await r.json();
+    if (j.ok) { chip.textContent = j.model.label; chip.classList.add('ok'); }
+    else { chip.textContent = 'فشل: '+(j.error||''); }
+  } catch(e) { chip.textContent = 'فشل: '+e; }
+};
 
 document.querySelectorAll('.tabs button').forEach(b => {
   b.onclick = () => {
@@ -459,11 +491,14 @@ async function sendMsg(text){
   const assistant = addRow('assistant', '<em style="color:var(--muted)">جاري التفكير…</em>');
   assistant.classList.add('cursor');
   let full = '';
-  const url = mode==='run' ? '/run' : (mode==='claw' ? '/claw' : (mode==='aider' ? '/aider' : '/agent'));
+  const url = mode === 'claw' ? '/claw' : '/ask';
+  const payload = mode === 'claw'
+    ? {message:text, history}
+    : {message:text, history, lane};
   try {
     const resp = await fetch(url, {
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({message:text, history}),
+      body: JSON.stringify(payload),
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
@@ -479,7 +514,11 @@ async function sendMsg(text){
         const da = (lines.find(l=>l.startsWith('data:'))||'').slice(5);
         let p; try { p = JSON.parse(da); } catch { continue; }
         logLine('['+ev+'] '+JSON.stringify(p).slice(0,200));
-        if (ev === 'start') addCard(mode==='claw'?'claw':'plan','● Start · '+mode, JSON.stringify(p,null,2));
+        if (ev === 'route') {
+          const laneName = {chat:'💬 Chat', aider:'💎 Aider', agent:'⚡ ReAct', plan:'🧠 Plan'}[p.lane]||p.lane;
+          addCard('plan','🎯 Routed → '+laneName, 'model: '+(p.model_label||p.model));
+        }
+        else if (ev === 'start') addCard(mode==='claw'?'claw':'plan','● Start · '+mode, JSON.stringify(p,null,2));
         else if (ev === 'phase') addCard('plan','— Phase: '+p.phase, '');
         else if (ev === 'plan') { renderPlan(p.tasks||[]); addCard('plan','🗺️ Plan — '+(p.summary||''), JSON.stringify(p.tasks,null,2)); }
         else if (ev === 'task_start') { markPlan(p.idx,'running'); addCard('plan','▷ Task '+(p.idx+1)+' start', p.task); }

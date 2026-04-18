@@ -5,14 +5,31 @@ A **fully local, autonomous coding agent** with a Devin-style web UI, powered by
 **Qwen2.5-Coder-7B-Instruct** (or any GGUF model you pick). Zero external APIs,
 zero telemetry, runs offline on a single Linux box.
 
-It offers **four execution modes** side-by-side:
+The UI exposes a **single unified "Agent" entry point** (`POST /ask`) that classifies the
+incoming message and routes it to the best-fit lane:
 
-| Mode | Endpoint | What it does |
+| Lane | Triggered when the message… | Executor |
 |---|---|---|
-| 🧠 **Plan-Execute-Critique** | `POST /run` | Planner LLM → decomposes into tasks → Executor ReAct loop per task → Critic summarizes |
-| ⚡ **Fast Agent** | `POST /agent` | Single ReAct loop with the typed tool set — fastest path for simple jobs |
-| 💎 **Aider** | `POST /aider` | Delegates to [Aider](https://github.com/Aider-AI/aider) OSS coding agent (whole-file edit format) |
-| 🦀 **Claw Code** | `POST /claw` | Delegates to the [Claw Code](https://github.com/ultraworkers/claw-code) Rust CLI via an Anthropic↔OpenAI shim |
+| 💬 **chat** | is a greeting / factual question without file or shell intent | one-shot LLM call |
+| 💎 **aider** | asks to create/modify a specific file or function | [Aider](https://github.com/Aider-AI/aider) OSS coding agent |
+| ⚡ **agent** | asks to run/execute shell-like actions | single ReAct loop with the typed tool set |
+| 🧠 **plan** | contains multiple steps (`then`, numbered list…) | full Planner → Executor → Critic pipeline |
+
+You can override the lane from the UI dropdown or via `{"lane": "aider"|"plan"|"agent"|"chat"}`
+in the JSON body. Legacy direct endpoints (`/run`, `/agent`, `/aider`, `/claw`) are still available.
+
+### Model registry
+
+Three GGUF models are pre-registered and hot-swappable without restarting the server:
+
+| ID | Label | RAM | Notes |
+|---|---|---|---|
+| `qwen-1.5b` | Qwen2.5-Coder-1.5B | ~1.5 GB | default, fastest |
+| `deepseek-6.7b` | DeepSeek-Coder-6.7B | ~4.5 GB | strongest coder that fits on an 8 GB box |
+| `qwen-7b` | Qwen2.5-Coder-7B | ~5.5 GB | good all-rounder, slower |
+
+`GET /models` lists them, `POST /switch_model {"model_id":"deepseek-6.7b"}` restarts
+llama-server with the chosen GGUF and repoints Aider at it automatically.
 
 ## Speed notes
 

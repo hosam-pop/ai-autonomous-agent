@@ -61,6 +61,80 @@ AIDER_TIMEOUT = int(os.environ.get("AIDER_TIMEOUT", "600"))
 MAX_OUT_BYTES = 12_000
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "600"))
 
+# ---------------------------- model registry ----------------------------
+# Each entry: id, label, gguf path, ctx size, chat template, approx RAM.
+MODELS: dict[str, dict[str, Any]] = {
+    "qwen-1.5b": {
+        "id": "qwen-1.5b",
+        "label": "Qwen2.5-Coder-1.5B (fast)",
+        "path": "/opt/model/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "ctx": 8192,
+        "template": "chatml",
+        "ram_gb": 1.5,
+    },
+    "deepseek-6.7b": {
+        "id": "deepseek-6.7b",
+        "label": "DeepSeek-Coder-6.7B (smarter)",
+        "path": "/opt/model/deepseek-coder-6.7b-instruct.Q4_K_M.gguf",
+        "ctx": 8192,
+        "template": "deepseek",
+        "ram_gb": 4.5,
+    },
+    "qwen-7b": {
+        "id": "qwen-7b",
+        "label": "Qwen2.5-Coder-7B (heavy)",
+        "path": "/opt/model/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        "ctx": 8192,
+        "template": "chatml",
+        "ram_gb": 5.5,
+    },
+}
+ACTIVE_MODEL_ID: str = os.environ.get("ACTIVE_MODEL", "qwen-1.5b")
+LLAMA_BIN = os.environ.get("LLAMA_SERVER_BIN", "/opt/llama.cpp/llama-b8838/llama-server")
+LLAMA_LOG = Path(os.environ.get("LLAMA_SERVER_LOG", "/tmp/llama_server.log"))
+
+
+def _llama_running_with(path: str) -> bool:
+    try:
+        r = subprocess.run(["pgrep", "-af", "llama-server"], capture_output=True, text=True)
+        return path in r.stdout
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def start_llama(model_id: str) -> dict[str, Any]:
+    """(Re)start llama-server with the chosen model. Returns info dict."""
+    global ACTIVE_MODEL_ID, AIDER_MODEL  # noqa: PLW0603
+    m = MODELS.get(model_id)
+    if not m:
+        return {"ok": False, "error": f"unknown model {model_id}"}
+    if not Path(m["path"]).exists():
+        return {"ok": False, "error": f"model file missing: {m['path']}"}
+    if _llama_running_with(m["path"]):
+        ACTIVE_MODEL_ID = model_id
+        AIDER_MODEL = f"openai/{Path(m['path']).name}"
+        return {"ok": True, "already_running": True, "model": m}
+    subprocess.run(["pkill", "-f", "llama-server"], check=False)
+    time.sleep(2)
+    LLAMA_LOG.write_text("", encoding="utf-8")
+    # Build command
+    cmd = [LLAMA_BIN, "-m", m["path"], "--host", "127.0.0.1", "--port", "8081",
+           "-c", str(m["ctx"]), "-t", "4", "--chat-template", m["template"]]
+    subprocess.Popen(cmd, stdout=open(LLAMA_LOG, "ab"), stderr=subprocess.STDOUT, start_new_session=True)
+    # Wait for /health
+    for _ in range(60):
+        try:
+            r = httpx.get("http://127.0.0.1:8081/health", timeout=1.5)
+            if r.status_code == 200:
+                ACTIVE_MODEL_ID = model_id
+                AIDER_MODEL = f"openai/{Path(m['path']).name}"
+                return {"ok": True, "restarted": True, "model": m}
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(1)
+    return {"ok": False, "error": "llama-server did not become healthy in 60s"}
+
+
 app = FastAPI()
 
 # ---------------------------- prompts ----------------------------
@@ -327,11 +401,43 @@ async def healthz() -> dict:
     async with httpx.AsyncClient(timeout=5) as client:
         try:
             r = await client.get(f"{BACKEND}/models")
-            return {"ok": r.status_code < 500, "backend": BACKEND, "workspace": str(WORKSPACE),
-                    "claw_bin": str(CLAW_BIN), "claw_available": CLAW_BIN.exists(),
-                    "memory_entries": len(load_memory(10_000))}
+            return {
+                "ok": r.status_code < 500,
+                "backend": BACKEND,
+                "workspace": str(WORKSPACE),
+                "claw_bin": str(CLAW_BIN),
+                "claw_available": CLAW_BIN.exists(),
+                "memory_entries": len(load_memory(10_000)),
+                "active_model": ACTIVE_MODEL_ID,
+                "active_model_label": MODELS.get(ACTIVE_MODEL_ID, {}).get("label", ""),
+            }
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "backend": BACKEND, "error": str(exc)}
+
+
+@app.get("/models")
+def list_models() -> JSONResponse:
+    out = []
+    for mid, m in MODELS.items():
+        out.append({
+            "id": mid,
+            "label": m["label"],
+            "ram_gb": m["ram_gb"],
+            "available": Path(m["path"]).exists(),
+            "active": mid == ACTIVE_MODEL_ID,
+        })
+    return JSONResponse(content={"models": out, "active": ACTIVE_MODEL_ID})
+
+
+@app.post("/switch_model")
+async def switch_model(request: Request) -> JSONResponse:
+    body = await request.json()
+    mid = body.get("model_id", "").strip()
+    if mid not in MODELS:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "unknown model"})
+    # Offload to thread because start_llama is synchronous.
+    info = await asyncio.to_thread(start_llama, mid)
+    return JSONResponse(content=info)
 
 
 @app.get("/files")
@@ -588,6 +694,107 @@ async def claw_endpoint(request: Request) -> StreamingResponse:
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+# ---------------------------- /ask (unified router) ----------------------------
+
+# Heuristic: classify an incoming message into one of four lanes.
+# - aider:  "create/write/modify a file X with …", filename-ish words
+# - plan:   multi-step task (has ' and ', ' then ', numbered list, ≥2 verbs)
+# - agent:  wants shell/run/execute (run, execute, install, list files, grep)
+# - chat:   everything else (greeting, explanation question, short Q)
+_FILE_LIKE = re.compile(r"\b[\w/.-]+\.(py|js|ts|tsx|jsx|html|css|json|md|txt|sh|yml|yaml|toml)\b", re.I)
+_SHELL_WORDS = ("run ", "execute ", "install ", "ls ", "grep ", "find ", "apt ", "pip ",
+                "npm ", "bash ", "shell ", "terminal")
+_CREATE_WORDS = ("create ", "write ", "generate ", "make ", "implement ",
+                 "add ", "build ", "refactor ", "rewrite ", "modify ", "edit ", "update ",
+                 "أنشئ", "اكتب", "اصنع", "عدّل", "عدل", "أضف", "ابنِ", "ابني")
+_MULTI_STEP = (" and then ", " then ", " after that ", ";", " ثم ", " وبعد ", " و بعد ",
+               "\n1.", "\n2.", "\n- ")
+
+
+def classify_intent(msg: str) -> str:
+    low = msg.lower().strip()
+    if not low:
+        return "chat"
+    has_file = bool(_FILE_LIKE.search(msg))
+    has_create = any(w in low for w in _CREATE_WORDS)
+    has_shell = any(w in low for w in _SHELL_WORDS)
+    has_multi = any(w in low for w in _MULTI_STEP)
+    # plan lane: multi-step OR both shell+create
+    if has_multi and (has_create or has_shell):
+        return "plan"
+    # aider lane: creating/modifying a file (preferably with extension)
+    if has_create and (has_file or "file" in low or "script" in low or "function" in low or
+                       "class" in low or "component" in low):
+        return "aider"
+    # fast agent lane: shell-oriented
+    if has_shell:
+        return "agent"
+    # multi-step without clear create/shell still goes to plan
+    if has_multi:
+        return "plan"
+    return "chat"
+
+
+async def _chat_stream(user_msg: str, history: list[dict[str, Any]]) -> AsyncIterator[bytes]:
+    """Simple one-shot chat response — no tools."""
+    messages: list[dict[str, Any]] = [{
+        "role": "system",
+        "content": (
+            "You are a friendly helpful assistant running locally on a small "
+            "model. Answer directly in the user's language. Keep answers short "
+            "unless the user asks for depth."
+        ),
+    }]
+    for t in history[-6:]:
+        messages.append({"role": t["role"], "content": t["content"]})
+    messages.append({"role": "user", "content": user_msg})
+    yield sse("start", {"mode": "chat", "lane": "chat"})
+    try:
+        text = await llm(messages, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
+    except Exception as exc:  # noqa: BLE001
+        yield sse("error", {"error": f"llm: {exc}"}); return
+    yield sse("final", {"message": text.strip()})
+    yield sse("end", {})
+
+
+@app.post("/ask")
+async def ask_endpoint(request: Request) -> StreamingResponse:
+    body = await request.json()
+    user_msg = (body.get("message") or "").strip()
+    history = body.get("history") or []
+    override = (body.get("lane") or "auto").strip().lower()
+    if not user_msg:
+        return StreamingResponse(iter([sse("error", {"error": "empty message"})]),
+                                 media_type="text/event-stream")
+    lane = override if override in ("aider", "plan", "agent", "chat") else classify_intent(user_msg)
+
+    async def gen() -> AsyncIterator[bytes]:
+        yield sse("route", {"lane": lane, "model": ACTIVE_MODEL_ID,
+                            "model_label": MODELS.get(ACTIVE_MODEL_ID, {}).get("label", "")})
+        if lane == "chat":
+            async for b in _chat_stream(user_msg, history):
+                yield b
+            return
+        # delegate to existing handlers by constructing a fake Request
+        body_bytes = json.dumps({"message": user_msg, "history": history}).encode()
+        async def receive():  # starlette receive callable
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+        scope = {"type": "http", "method": "POST", "headers": [(b"content-type", b"application/json")]}
+        sub_req = Request(scope, receive)
+        if lane == "agent":
+            resp: StreamingResponse = await agent_endpoint(sub_req)
+        elif lane == "plan":
+            resp = await run_endpoint(sub_req)
+        elif lane == "aider":
+            resp = await aider_endpoint(sub_req)
+        else:
+            yield sse("error", {"error": f"unknown lane {lane}"}); return
+        async for chunk in resp.body_iterator:
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 # ---------------------------- /aider ----------------------------
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -664,7 +871,19 @@ async def aider_endpoint(request: Request) -> StreamingResponse:
         except Exception:  # noqa: BLE001
             pass
         yield sse("files", {"files": aider_files, "root": str(AIDER_CWD)})
-        yield sse("final", {"message": "\n".join(buf[-50:])[-4000:] or "(no output)"})
+
+        # Strip Aider boilerplate (version banner, token counter, warnings) before showing the user.
+        noise_prefixes = (
+            "Warning:", "Analytics ", "Aider v", "Model:", "Git repo:",
+            "Repo-map:", "Tokens:", "Main model:", "Weak model:",
+            "Editor model:", "Added ", "Dropped ", "You can use ",
+        )
+        cleaned = [ln for ln in buf if ln and not ln.startswith(noise_prefixes)]
+        msg = "\n".join(cleaned).strip()
+        if not msg or all(len(ln) < 4 for ln in cleaned):
+            # Fallback for trivial / refused responses
+            msg = "\n".join(buf[-10:]).strip() or "(no output)"
+        yield sse("final", {"message": msg[-4000:]})
         yield sse("end", {})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
