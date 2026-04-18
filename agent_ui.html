@@ -237,6 +237,7 @@
     <div class="mode">
       <button id="m-run" class="active" title="خطة → تنفيذ → نقد">🧠 Plan-Execute</button>
       <button id="m-agent" title="ReAct واحد، أسرع">⚡ Fast</button>
+      <button id="m-aider" title="Aider OSS (أسرع للكود)">💎 Aider</button>
       <button id="m-claw" title="Claw CLI (بطيء)">🦀 Claw</button>
     </div>
     <button class="icon-btn" id="btnReset" title="مسح الـ workspace">🗑️</button>
@@ -304,7 +305,7 @@ marked.setOptions({
 });
 
 let mode = 'run';
-['run','agent','claw'].forEach(k => {
+['run','agent','aider','claw'].forEach(k => {
   document.getElementById('m-'+k).onclick = () => {
     mode = k;
     document.querySelectorAll('.mode button').forEach(b=>b.classList.remove('active'));
@@ -458,7 +459,7 @@ async function sendMsg(text){
   const assistant = addRow('assistant', '<em style="color:var(--muted)">جاري التفكير…</em>');
   assistant.classList.add('cursor');
   let full = '';
-  const url = mode==='run' ? '/run' : (mode==='claw' ? '/claw' : '/agent');
+  const url = mode==='run' ? '/run' : (mode==='claw' ? '/claw' : (mode==='aider' ? '/aider' : '/agent'));
   try {
     const resp = await fetch(url, {
       method:'POST', headers:{'content-type':'application/json'},
@@ -498,6 +499,7 @@ async function sendMsg(text){
         else if (ev === 'memory') { /* refresh memory tab */ refreshMemory(); }
         else if (ev === 'files') refreshFiles();
         else if (ev === 'claw_payload') addCard('claw','Claw payload', JSON.stringify(p.payload,null,2));
+        else if (ev === 'aider_line') addCard('act','💎 aider', p.text||'');
         else if (ev === 'stderr') addCard('err','stderr', p.text||'');
         else if (ev === 'final') { full = p.message||''; assistant.innerHTML = render(full); history.push({role:'assistant', content: full}); }
         else if (ev === 'error') { addCard('err','✗ Error', p.error||'unknown'); if (!full) assistant.innerHTML = '<span style="color:var(--err)">فشل: '+esc(p.error||'unknown')+'</span>'; }

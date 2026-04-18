@@ -34,7 +34,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 # ---------------------------- config ----------------------------
 BACKEND = os.environ.get("OPENAI_BACKEND", "http://127.0.0.1:8081/v1")
-MODEL_LABEL = os.environ.get("MODEL_LABEL", "Qwen2.5-Coder-7B (local)")
+MODEL_LABEL = os.environ.get("MODEL_LABEL", "Qwen2.5-Coder-1.5B (local)")
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/home/ubuntu/agent_workspace")).resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 MEMORY_DIR = WORKSPACE / ".memory"
@@ -51,6 +51,13 @@ MAX_TASKS = int(os.environ.get("AGENT_TASKS", "3"))
 SHELL_TIMEOUT = int(os.environ.get("AGENT_SHELL_TIMEOUT", "45"))
 PY_TIMEOUT = int(os.environ.get("AGENT_PY_TIMEOUT", "45"))
 CLAW_TIMEOUT = int(os.environ.get("CLAW_TIMEOUT", "1800"))
+
+AIDER_BIN = Path(os.environ.get("AIDER_BIN", "/opt/aider_venv/bin/aider"))
+AIDER_CWD = Path(os.environ.get("AIDER_CWD", "/home/ubuntu/aider_workspace")).resolve()
+AIDER_CWD.mkdir(parents=True, exist_ok=True)
+AIDER_MODEL = os.environ.get("AIDER_MODEL", "openai/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
+AIDER_TIMEOUT = int(os.environ.get("AIDER_TIMEOUT", "600"))
+
 MAX_OUT_BYTES = 12_000
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "600"))
 
@@ -576,6 +583,88 @@ async def claw_endpoint(request: Request) -> StreamingResponse:
                 except Exception:  # noqa: BLE001
                     continue
         yield sse("final", {"message": msg or so.strip().splitlines()[-1] if so.strip() else "(no output)"})
+        yield sse("end", {})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# ---------------------------- /aider ----------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+
+@app.post("/aider")
+async def aider_endpoint(request: Request) -> StreamingResponse:
+    body = await request.json()
+    user_msg = (body.get("message") or "").strip()
+    if not user_msg:
+        return StreamingResponse(iter([sse("error", {"error": "empty message"})]),
+                                 media_type="text/event-stream")
+
+    async def gen() -> AsyncIterator[bytes]:
+        env = os.environ.copy()
+        env["OPENAI_API_BASE"] = BACKEND
+        env["OPENAI_API_KEY"] = "sk-local-dummy"
+        env["AIDER_ANALYTICS_DISABLE"] = "true"
+        env["NO_COLOR"] = "1"
+        yield sse("start", {"mode": "aider", "cwd": str(AIDER_CWD), "model": AIDER_MODEL, "timeout": AIDER_TIMEOUT})
+        if not AIDER_BIN.exists():
+            yield sse("error", {"error": f"aider binary not found at {AIDER_BIN}"}); return
+
+        cmd = [
+            str(AIDER_BIN),
+            "--model", AIDER_MODEL,
+            "--no-git", "--yes", "--no-auto-commits",
+            "--no-show-model-warnings", "--no-check-update",
+            "--no-pretty", "--no-stream",
+            "--message", user_msg,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=str(AIDER_CWD), env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            yield sse("error", {"error": f"spawn: {exc}"}); return
+
+        started = time.monotonic()
+        buf: list[str] = []
+        try:
+            assert proc.stdout is not None
+            while True:
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    elapsed = time.monotonic() - started
+                    if elapsed > AIDER_TIMEOUT:
+                        proc.kill()
+                        yield sse("error", {"error": f"aider timed out after {AIDER_TIMEOUT}s"}); return
+                    yield sse("heartbeat", {"elapsed_s": round(elapsed, 1), "alive": True})
+                    continue
+                if not line:
+                    break
+                text = _strip_ansi(line.decode("utf-8", errors="replace")).rstrip()
+                if not text:
+                    continue
+                buf.append(text)
+                yield sse("aider_line", {"text": text[-500:]})
+        finally:
+            await proc.wait()
+
+        aider_files = []
+        try:
+            for p in sorted(AIDER_CWD.rglob("*")):
+                if p.is_file() and not p.name.startswith(".aider."):
+                    rel = str(p.relative_to(AIDER_CWD))
+                    aider_files.append({"path": rel, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)})
+        except Exception:  # noqa: BLE001
+            pass
+        yield sse("files", {"files": aider_files, "root": str(AIDER_CWD)})
+        yield sse("final", {"message": "\n".join(buf[-50:])[-4000:] or "(no output)"})
         yield sse("end", {})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
